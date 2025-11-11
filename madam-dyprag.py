@@ -292,27 +292,42 @@ def text_to_delta(agg_text: str, model, tokenizer, projector: ParameterTranslato
     return deltas
 
 
-def messages_to_avg_delta(msg_list: List[str], model, tokenizer, projector: ParameterTranslator, max_len: int = 1500):
+def messages_to_avg_delta(msg_list, model, tokenizer, projector, max_len: int = 1500):
     """
-    多段文本 -> 多个 delta -> 逐键平均：
-      avg_delta[k] = (sum_i delta_i[k]) / count_k
+    多段文本 -> 多个 delta -> 逐键平均（与 DyPRAG 示例保持同款：stack+mean）。
     """
-    sum_dict = {}
-    cnt_dict = {}
+    dev = next(model.parameters()).device
+    all_deltas = []
 
     for msg in msg_list:
-        d = text_to_delta(msg, model, tokenizer, projector, max_len=max_len)
-        for k, v in d.items():
-            if k in sum_dict:
-                sum_dict[k] = sum_dict[k] + v
-                cnt_dict[k] += 1
-            else:
-                sum_dict[k] = v.clone()
-                cnt_dict[k] = 1
+        tokens = tokenizer(
+            msg,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=max_len
+        )
+        tokens = {k: v.to(dev) for k, v in tokens.items()}
 
-    # 求平均
-    avg = {k: (sum_dict[k] / float(cnt_dict[k])) for k in sum_dict.keys()}
-    return avg
+        with torch.no_grad():
+            out = model(tokens["input_ids"],
+                        attention_mask=tokens.get("attention_mask", None),
+                        output_hidden_states=True)
+            # 取最后一层、最后一个 token 隐向量（与 DyPRAG 保持一致）
+            input_embeds = out.hidden_states[-1][:, -1, :]      # [1, hidden_size]
+            outputs = projector(input_embeds)                    # dict[str, Tensor]
+            all_deltas.append(outputs)
+
+    # 取所有 delta 字典的公共键，避免缺键时报错
+    common_keys = set(all_deltas[0].keys())
+    for d in all_deltas[1:]:
+        common_keys &= set(d.keys())
+
+    merged = {}
+    for k in common_keys:
+        merged[k] = torch.stack([d[k] for d in all_deltas], dim=0).mean(dim=0)
+
+    return merged
 
 
 # -----------------------------
