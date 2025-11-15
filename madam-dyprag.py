@@ -171,47 +171,47 @@ def agent_response(query: str, document: str, model, tokenizer, generation_confi
     if agg_summary and history:
         prompt = f"""You are an agent reading a document to answer a question.
 
-Question: {query}
-Document: {document}
+            Question: {query}
+            Document: {document}
 
-Aggregator summary from the previous round:
-{agg_summary}
+            Aggregator summary from the previous round:
+            {agg_summary}
 
-Additionally, here are other agents' previous responses as context:
-{history}
+            Additionally, here are other agents' previous responses as context:
+            {history}
 
-Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
-Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+            Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
+            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     elif agg_summary:
         prompt = f"""You are an agent reading a document to answer a question.
 
-Question: {query}
-Document: {document}
+            Question: {query}
+            Document: {document}
 
-The following is the aggregator-generated summary from the previous round:
-{agg_summary}
+            The following is the aggregator-generated summary from the previous round:
+            {agg_summary}
 
-Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
-Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+            Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
+            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     elif history:
         prompt = f"""You are an agent reading a document to answer a question.
 
-Question: {query}
-Document: {document}
+            Question: {query}
+            Document: {document}
 
-The following responses are from other agents as additional information.
-{history}
+            The following responses are from other agents as additional information.
+            {history}
 
-Answer the question based on the document and other agents' response. Provide your answer and a step-by-step reasoning explanation.
-Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+            Answer the question based on the document and other agents' response. Provide your answer and a step-by-step reasoning explanation.
+            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     else:
         prompt = f"""You are an agent reading a document to answer a question.
 
-Question: {query}
-Document: {document}
+            Question: {query}
+            Document: {document}
 
-Answer the question based only on this document. Provide your answer and a step-by-step reasoning explanation.
-Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+            Answer the question based only on this document. Provide your answer and a step-by-step reasoning explanation.
+            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
 
     messages = [{"role": "user", "content": prompt}]
     return call_llm_chat(messages, model, tokenizer, generation_config)

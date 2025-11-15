@@ -1,60 +1,57 @@
-#!/bin/bash
-#SBATCH --partition=NV3090
-#SBATCH --job-name=madam-dyprag
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:4098:1
-#SBATCH --time=2-00:00:00
-#SBATCH -o logs/%x-%j.out
+#!/usr/bin/env bash
+# 或者直接写：#!/bin/bash
 
-# --------------------
-# 基本设置：错误立刻退出
-# --------------------
 set -Eeuo pipefail
 
-# 工作目录：你的 RAMDocs 项目路径
+########################
+# 1. 基本环境初始化
+########################
+
+# 项目目录
 cd /share/home/yangjj/RAMDocs
 
 # 激活 conda 环境
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate faithful-rag
 
-# 如果没建好日志和 cache 目录，可以在这里再保险建一次
-# mkdir -p logs cache
+# 确保日志目录存在
+mkdir -p logs cache
 
-# --------------------
-# 要执行的 Python 命令
-# 这里已经把你那串参数全部写进来了
-# --------------------
+########################
+# 2. 定义要执行的 python 命令
+########################
 CMD=(
   python -u madam-dyprag.py
   --model_name qwen2.5-1.5b-instruct
   --data_path /share/home/yangjj/RAMDocs/RAMDocs_test.jsonl
   --num_rounds 3
-  --message_transport dyprag
+  --message_transport text
   --projector_path /share/home/yangjj/DyPRAG/projector/qwen2.5-1.5b-instruct_hidden32_sample1.0_lr1e-05_augllama3.2-1b-instruct
   --inference_epoch 1
   --lora_rank 2
   --projector_p 32
-  --agent_context history
+  --agent_context aggregator
   --debug
 )
 
-# --------------------
-# 把 shell 打印 + python 输出 一起通过 awk 加时间戳
-# --------------------
+########################
+# 3. 执行命令 + 时间戳日志
+########################
+
+LOG_FILE="logs/madam-dyprag-$(date +%Y%m%d-%H%M%S).log"
+
 {
-  # 基本 SLURM 环境信息（相当于原 sh 里的 printf）
+  # 打印 SLURM 环境信息（如果当前是在 srun/salloc 里，这些变量会存在）
   printf "SLURM: job_id=%s step_id=%s name=%s partition=%s ntasks=%s cpus_per_task=%s gres=%s nodelist=%s\n" \
     "${SLURM_JOB_ID:-}" "${SLURM_STEP_ID:-}" "${SLURM_JOB_NAME:-}" "${SLURM_JOB_PARTITION:-}" \
     "${SLURM_NTASKS:-}" "${SLURM_CPUS_PER_TASK:-}" "${SLURM_JOB_GRES:-}" "${SLURM_NODELIST:-}"
 
-  # scontrol 信息
+  # scontrol 信息（如果有 job id）
   if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     scontrol show job "${SLURM_JOB_ID}" -o | sed "s/^/SCONTROL: /"
   fi
 
-  # 要执行的命令
+  # 打印 CMD
   printf "CMD: "
   printf "%q " "${CMD[@]}"
   echo
@@ -68,8 +65,7 @@ CMD=(
   BEGIN { fflush() }
   {
     gsub(/\r/, "", $0);
-    # 在每一行前加时间戳
     print strftime("[%Y-%m-%d %H:%M:%S]"), $0;
     fflush();
   }
-'
+' | tee "$LOG_FILE"
