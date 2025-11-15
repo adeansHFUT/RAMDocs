@@ -3,8 +3,8 @@
 #SBATCH --job-name=madam-dyprag
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:4090:1
-#SBATCH --time=5:00:00
+#SBATCH --gres=gpu:3090:1
+#SBATCH --time=8:00:00
 #SBATCH -o logs/%x-%j.out
 
 # --------------------
@@ -37,12 +37,12 @@ CMD=(
   --model_name qwen2.5-1.5b-instruct
   --data_path /share/home/yangjj/RAMDocs/RAMDocs_test.jsonl
   --num_rounds 3
-  --message_transport full-dyprag-combine
+  --message_transport full-dyprag
   --projector_path /share/home/yangjj/DyPRAG/projector/qwen2.5-1.5b-instruct_hidden32_sample1.0_lr1e-05_augllama3.2-1b-instruct
   --inference_epoch 1
   --lora_rank 2
   --projector_p 32
-  --agent_context history
+  --agent_context aggregator
   --debug
 )
 

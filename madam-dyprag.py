@@ -227,7 +227,14 @@ def aggregate_responses(query: str, responses: List[str], model, tokenizer, gene
         joined = "\n".join([f"Agent {i+1}: {r}" for i, r in enumerate(responses)])
         body = f"Agent responses:\n{joined}\n"
     elif joined_text == "":
-        body = "Agent responses are provided via an internal compressed channel.\n"
+        body = (
+        "The other agents' responses have been integrated into your internal state for THIS question "
+        "via an internal compressed parameter channel. "
+        "You cannot see their raw texts, but you should treat this internal signal as additional, "
+        "question-specific knowledge derived from the agents' answers. "
+        "Do NOT assume any specific content that is not supported by this internal signal or the question itself. "
+        "If the internal signal is insufficient, reply exactly 'unknown'.\n"
+    )
     else:
         body = f"Agent responses:\n{joined_text}\n"
 
@@ -236,8 +243,17 @@ def aggregate_responses(query: str, responses: List[str], model, tokenizer, gene
 If there are multiple answers, please provide all possible correct answers and also provide a step-by-step reasoning explanation. If there is no correct answer, please reply 'unknown'.
 Please follow the format: 'All Correct Answers: []. Explanation: {{}}.'
 
-{body}
+The following are examples:
+Question: In which year was Michael Jordan born?
+Agent responses:
+Agent 1: Answer: 1963. Explanation: The document clearly states that Michael Jeffrey Jordan was born on February 17, 1963. 
+Agent 2: Answer: 1956. Explanation: The document states that Michael Irwin Jordan was born on February 25, 1956. However, it's important to note that this document seems to be about a different Michael Jordan, who is an American scientist, not the basketball player. The other agents' responses do not align with the information provided in the document.
+Agent 3: Answer: 1998. Explanation: The According to the document provided, Michael Jeffrey Jordan was born on February 17, 1998.
+Agent 4: Answer: Unknown. Explanation: The provided document focuses on Jordan's college and early professional career, mentioning his college championship in 1982 and his entry into the NBA in 1984, but it does not include information about his birth year.
+All Correct Answers: ["1963", "1956"]. Explanation: Agent 1 is talking about the basketball player Michael Jeffrey Jordan, who was born on Februray 17, 1963, so 1963 is correct. Agent 2 is talking about another person named Michael Jordan, who is an American scientist, and he was born in 1956. Therefore, the answer 1956 from Agent 2 is also correct. Agent 3 provides an error stating Michael Jordan's birth year as 1998, which is incorrect. Based on the correct information from Agent 1, Michael Jeffrey Jordan was born on February 17, 1963. Agent 4 does not provide any useful information.
+
 Question: {query}
+{body}
 """
     messages = [{"role": "user", "content": prompt}]
     return call_llm_chat(messages, model, tokenizer, generation_config)
