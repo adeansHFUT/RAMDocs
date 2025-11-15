@@ -88,12 +88,16 @@ def _detect_gpu_name() -> str:
 def normalize_answer(s: str) -> str:
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
+
     def white_space_fix(text):
         return ' '.join(text.split())
+
     def remove_punc(text):
         return ''.join(ch for ch in text if ch not in string.punctuation)
+
     def lower(text):
         return text.lower()
+
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
@@ -166,77 +170,126 @@ def call_llm_chat(messages, model, tokenizer, generation_config, max_new_tokens:
 # Prompts
 # -----------------------------
 
-def agent_response(query: str, document: str, model, tokenizer, generation_config,
-                   history: str = "", agg_summary: str = ""):
+def agent_response(
+    query: str,
+    document: str,
+    model,
+    tokenizer,
+    generation_config,
+    history: str = "",
+    agg_summary: str = "",
+    injected: bool = False,
+):
+    """
+    injected=True 表示本轮 agent 在前向前已经通过 LoRA 注入收到了上一轮的信息
+   （可能来自 aggregator summary 或 agents history）。
+    """
+    inject_hint = ""
+    if injected:
+        inject_hint = (
+            "\nNote: Some information from previous rounds has been integrated into your "
+            "internal state for THIS question via an internal compressed parameter channel. "
+            "You should use this internal signal together with the document and any visible "
+            "context when answering, but do NOT assume specific details that are not supported "
+            "by either the document, the visible context, or the question itself.\n"
+        )
+
     if agg_summary and history:
         prompt = f"""You are an agent reading a document to answer a question.
 
-            Question: {query}
-            Document: {document}
+Question: {query}
+Document: {document}
 
-            Aggregator summary from the previous round:
-            {agg_summary}
+Aggregator summary from the previous round:
+{agg_summary}
 
-            Additionally, here are other agents' previous responses as context:
-            {history}
-
-            Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
-            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+Additionally, here are other agents' previous responses as context:
+{history}
+{inject_hint}
+Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
+Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     elif agg_summary:
         prompt = f"""You are an agent reading a document to answer a question.
 
-            Question: {query}
-            Document: {document}
+Question: {query}
+Document: {document}
 
-            The following is the aggregator-generated summary from the previous round:
-            {agg_summary}
-
-            Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
-            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+The following is the aggregator-generated summary from the previous round:
+{agg_summary}
+{inject_hint}
+Please reconsider your answer accordingly. Provide your answer and a step-by-step reasoning explanation.
+Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     elif history:
         prompt = f"""You are an agent reading a document to answer a question.
 
-            Question: {query}
-            Document: {document}
+Question: {query}
+Document: {document}
 
-            The following responses are from other agents as additional information.
-            {history}
-
-            Answer the question based on the document and other agents' response. Provide your answer and a step-by-step reasoning explanation.
-            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+The following responses are from other agents as additional information.
+{history}
+{inject_hint}
+Answer the question based on the document and other agents' response. Provide your answer and a step-by-step reasoning explanation.
+Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
     else:
         prompt = f"""You are an agent reading a document to answer a question.
 
-            Question: {query}
-            Document: {document}
-
-            Answer the question based only on this document. Provide your answer and a step-by-step reasoning explanation.
-            Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
+Question: {query}
+Document: {document}
+{inject_hint}
+Answer the question based only on this document (and any internal signal that may have been integrated into your parameters for this question). Provide your answer and a step-by-step reasoning explanation.
+Please follow the format: 'Answer: {{}}. Explanation: {{}}.'"""
 
     messages = [{"role": "user", "content": prompt}]
     return call_llm_chat(messages, model, tokenizer, generation_config)
 
 
-def aggregate_responses(query: str, responses: List[str], model, tokenizer, generation_config, joined_text: str | None = None):
+def aggregate_responses(
+    query: str,
+    responses: List[str],
+    model,
+    tokenizer,
+    generation_config,
+    joined_text: str | None = None,
+    injected: bool = False,
+):
     """
     joined_text=None  ：使用 responses 组装文本
     joined_text=""    ：不展示 agent 文本（仅靠注入的 LoRA 消息）
     joined_text="..." ：显式使用传入文本（combine 模式）
+
+    injected=True     ：当前聚合器在 forward 前已经注入了 agents 的 LoRA 消息
     """
     if joined_text is None:
+        # text-only，无额外注入提示
         joined = "\n".join([f"Agent {i+1}: {r}" for i, r in enumerate(responses)])
         body = f"Agent responses:\n{joined}\n"
     elif joined_text == "":
-        body = (
-        "The other agents' responses have been integrated into your internal state for THIS question "
-        "via an internal compressed parameter channel. "
-        "You cannot see their raw texts, but you should treat this internal signal as additional, "
-        "question-specific knowledge derived from the agents' answers. "
-        "Do NOT assume any specific content that is not supported by this internal signal or the question itself. "
-        "If the internal signal is insufficient, reply exactly 'unknown'.\n"
-    )
+        # LoRA-only：不暴露原始文本，但告诉模型信息已经注入其内部状态
+        if injected:
+            body = (
+                "The other agents' responses have been integrated into your internal state "
+                "for THIS question via an internal compressed parameter channel. "
+                "You cannot see their raw texts, but you should treat this internal signal as "
+                "additional, question-specific knowledge distilled from their answers. "
+                "Do NOT assume any specific content that is not supported by this internal signal "
+                "or by the question itself. If the internal signal is insufficient, reply exactly "
+                "'unknown'.\n"
+            )
+        else:
+            # 理论上不会出现（joined_text=="" 且未注入），但做个兜底
+            body = "Agent responses are not explicitly visible in text for this question.\n"
     else:
-        body = f"Agent responses:\n{joined_text}\n"
+        # combine 模式：既有文本，又有可能的注入
+        if injected:
+            body = (
+                f"Agent responses:\n{joined_text}\n\n"
+                "In addition, a compressed representation of these responses has been integrated "
+                "into your internal state via an internal parameter channel. "
+                "Use both the explicit texts and this internal signal when deciding which answers "
+                "are correct, but do NOT hallucinate details not supported by either.\n"
+            )
+        else:
+            body = f"Agent responses:\n{joined_text}\n"
 
     prompt = f"""You are an aggregator reading answers from multiple agents.
 
@@ -351,7 +404,7 @@ def multi_agent_debate(
     t0 = time.perf_counter()
     records["round1"] = {"answers": [], "explanations": []}
     for doc in documents:
-        response = agent_response(query, doc, model, tokenizer, generation_config)
+        response = agent_response(query, doc, model, tokenizer, generation_config, injected=False)
         answer = response[response.find("Answer: ") + len("Answer: "):response.find("Explanation")].strip()
         explanation = response[response.find("Explanation: ") + len("Explanation: "):]
         records["round1"]["answers"].append(answer)
@@ -388,7 +441,8 @@ def multi_agent_debate(
         try:
             records["round1"]["aggregation"] = aggregate_responses(
                 query, agent_outputs, model, tokenizer, generation_config,
-                joined_text=joined_text
+                joined_text=joined_text,
+                injected=comm_item["inject"],
             )
         finally:
             if comm_item["inject"]:
@@ -397,12 +451,15 @@ def multi_agent_debate(
                 except Exception as e:
                     _log(debug, f"[agents->aggregator] delta removal failed: {e}")
                 del aggr_deltas
-                torch.cuda.empty_cache(); gc.collect()
+                torch.cuda.empty_cache()
+                gc.collect()
 
         comm_debug["rounds"].append(comm_item)
     else:
         records["round1"]["aggregation"] = aggregate_responses(
-            query, agent_outputs, model, tokenizer, generation_config
+            query, agent_outputs, model, tokenizer, generation_config,
+            joined_text=None,
+            injected=False,
         )
 
     round_times["round1"] = float(f"{(time.perf_counter() - t0):.6f}")
@@ -494,7 +551,9 @@ def multi_agent_debate(
 
             resp = agent_response(
                 query, doc, model, tokenizer, generation_config,
-                agg_summary=agg_text_for_prompt, history=hist_text_for_prompt
+                agg_summary=agg_text_for_prompt,
+                history=hist_text_for_prompt,
+                injected=injected,
             )
 
             answer = resp[resp.find("Answer: ") + len("Answer: "):resp.find("Explanation")].strip()
@@ -576,7 +635,8 @@ def multi_agent_debate(
                 try:
                     records[round_key]["aggregation"] = aggregate_responses(
                         query, agent_outputs, model, tokenizer, generation_config,
-                        joined_text=joined_text
+                        joined_text=joined_text,
+                        injected=comm_item["inject"],
                     )
                 finally:
                     if comm_item["inject"]:
@@ -585,12 +645,15 @@ def multi_agent_debate(
                         except Exception as e:
                             _log(debug, f"[agents->aggregator] delta removal failed: {e}")
                         del aggr_deltas
-                        torch.cuda.empty_cache(); gc.collect()
+                        torch.cuda.empty_cache()
+                        gc.collect()
 
                 comm_debug["rounds"].append(comm_item)
             else:
                 records[round_key]["aggregation"] = aggregate_responses(
-                    query, agent_outputs, model, tokenizer, generation_config
+                    query, agent_outputs, model, tokenizer, generation_config,
+                    joined_text=None,
+                    injected=False,
                 )
 
             final_aggregation = records[round_key]["aggregation"]

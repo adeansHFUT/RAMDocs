@@ -37,7 +37,7 @@ CMD=(
   --model_name qwen2.5-1.5b-instruct
   --data_path /share/home/yangjj/RAMDocs/RAMDocs_test.jsonl
   --num_rounds 3
-  --message_transport full-dyprag
+  --message_transport dyprag
   --projector_path /share/home/yangjj/DyPRAG/projector/qwen2.5-1.5b-instruct_hidden32_sample1.0_lr1e-05_augllama3.2-1b-instruct
   --inference_epoch 1
   --lora_rank 2
