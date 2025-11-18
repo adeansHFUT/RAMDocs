@@ -10,6 +10,7 @@ MADAM-RAG with DyPRAG-style LoRA-as-message (delta inject/remove)
 + DEBUG 日志（标注 agents->aggregator / aggregator->agents 的通信路径）
 + 本次运行唯一前缀到输出文件名（避免相同参数的不同运行互相覆盖）
 - 移除断点续跑逻辑（每次运行都会完整评测数据集并覆盖输出）
++ 可选“参数知识代理”（param agent）：用模型自身参数生成一篇伪文档作为额外 agent
 
 依赖：
   - utils.py      : get_model, delta_inject, delta_remove
@@ -313,6 +314,37 @@ Question: {query}
 
 
 # -----------------------------
+# Param-knowledge agent: synthesize a pseudo-document from model parameters
+# -----------------------------
+
+def build_param_knowledge_document(
+    question: str,
+    model,
+    tokenizer,
+    generation_config,
+    max_new_tokens: int = 512,
+) -> str:
+    """
+    用模型自身参数（无外部文档）生成一篇“知识文档”，作为一个额外 agent 的输入。
+    Prompt:
+
+    Generate a document that provides accurate and relevant information to answer the given question.
+    If the information is unclear or uncertain, explicitly state 'I don't know' to avoid any hallucinations.
+    Question: {question}
+    Document:
+    """
+    prompt = (
+        "Generate a document that provides accurate and relevant information to answer the given question. "
+        "If the information is unclear or uncertain, explicitly state 'I don't know' to avoid any hallucinations.\n\n"
+        f"Question: {question}\n"
+        "Document:"
+    )
+    messages = [{"role": "user", "content": prompt}]
+    # 给这个“文档”稍微多一点 token 空间
+    return call_llm_chat(messages, model, tokenizer, generation_config, max_new_tokens=max_new_tokens)
+
+
+# -----------------------------
 # DyPRAG projector & delta messages
 # -----------------------------
 
@@ -384,17 +416,49 @@ def multi_agent_debate(
     projector: ParameterTranslator = None,
     agent_context: str = "aggregator",
     debug: bool = False,
+    use_param_agent: bool = False,   # <<< 新增：是否启用参数知识代理
 ):
     """
     agent_context: 'aggregator' | 'history' | 'both' | 'none'
     message_transport:
         'text' | 'dyprag' | 'dyprag-combine'
         'full-dyprag' | 'full-dyprag-combine'
+
+    use_param_agent:
+        若为 True，则先让模型基于自身参数生成一篇“知识文档”，
+        作为额外一个 document，加到 documents 末尾，对应一个额外 agent，
+        在所有轮次中与其他 agents 一起参与。
     """
     records = {}
     agent_outputs: List[str] = []
     round_times = {}
     comm_debug = {"rounds": []}
+
+    # --- 构造本地 documents 列表，并可选地追加 param-agent 文档 ---
+    documents = list(documents)  # 防止原列表被外部复用
+    param_doc = None
+    param_agent_index = None
+    if use_param_agent:
+        param_doc = build_param_knowledge_document(
+            question=query,
+            model=model,
+            tokenizer=tokenizer,
+            generation_config=generation_config,
+            max_new_tokens=512,
+        )
+        param_agent_index = len(documents)
+        documents.append(param_doc)
+        records["param_agent"] = {
+            "enabled": True,
+            "index": param_agent_index,
+            "document": param_doc,
+        }
+    else:
+        records["param_agent"] = {
+            "enabled": False,
+            "index": None,
+            "document": None,
+        }
 
     is_dyprag_like = message_transport in ("dyprag", "dyprag-combine", "full-dyprag", "full-dyprag-combine")
     is_combine = message_transport in ("dyprag-combine", "full-dyprag-combine")
@@ -698,12 +762,18 @@ def main():
     # debug logs
     parser.add_argument("--debug", action="store_true", help="print detailed comm-path logs")
 
+    # 是否启用“参数知识代理”
+    parser.add_argument("--use_param_agent", action="store_true",
+                        help="Add an extra agent that uses the model's own parametric knowledge (no external documents).")
+
     args = parser.parse_args()
     set_seed(args.seed)
 
     # ---- unique output path (prefix per run) ----
     run_prefix = _make_run_prefix()
     out_tag = f"msg-{args.message_transport}_ctx-{args.agent_context}"
+    if args.use_param_agent:
+        out_tag += "_withParamAgent"
     model_tag = args.model_name.split("/")[-1]
     base_name = os.path.basename(args.data_path)
     file_name = f"{run_prefix}_{base_name}_{out_tag}_{model_tag}_rounds{args.num_rounds}.jsonl"
@@ -747,6 +817,7 @@ def main():
                 projector=projector,
                 agent_context=args.agent_context,
                 debug=args.debug,
+                use_param_agent=args.use_param_agent,
             )
 
             pred = rec.get("final_answers") or parse_aggregator_answers(rec.get("final_aggregation", ""))

@@ -3,7 +3,7 @@
 #SBATCH --job-name=madam-dyprag
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:3090:1
+#SBATCH --gres=gpu:1
 #SBATCH --time=8:00:00
 #SBATCH -o logs/%x-%j.out
 
@@ -17,7 +17,7 @@ cd /share/home/yangjj/RAMDocs
 
 # 激活 conda 环境
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate faithful-rag
+conda activate dyprag
 
 # 如果没建好日志和 cache 目录，可以在这里再保险建一次
  mkdir -p logs cache
@@ -42,8 +42,9 @@ CMD=(
   --inference_epoch 1
   --lora_rank 2
   --projector_p 32
-  --agent_context aggregator
+  --agent_context history
   --debug
+  --use_param_agent
 )
 
 # --------------------
