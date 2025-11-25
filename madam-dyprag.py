@@ -11,7 +11,13 @@ MADAM-RAG with DyPRAG-style LoRA-as-message (delta inject/remove)
 + 本次运行唯一前缀到输出文件名（避免相同参数的不同运行互相覆盖）
 - 移除断点续跑逻辑（每次运行都会完整评测数据集并覆盖输出）
 + 可选“参数知识代理”（param agent）：用模型自身参数生成一篇伪文档作为额外 agent
-+ history + DyPRAG 模式下的置信度抑制：低置信度 agent 的 LoRA delta 在下一轮被缩放
++ history + DyPRAG 模式下的置信度抑制与增强：
+    - 低置信度 agent 的 LoRA delta 在下一轮被缩放（<1）
+    - 高置信度 agent 的 LoRA delta 在下一轮被放大（>1）
++ 首轮文档 LoRA 注入控制（--first_inject）：
+    - 0：首轮只用文档文本，不注入 LoRA
+    - 1：首轮仅注入文档 LoRA，不给文档文本（LoRA-only）
+    - 2：首轮既注入文档 LoRA，也给文档文本（LoRA+text）
 
 依赖：
   - utils.py      : get_model, delta_inject, delta_remove
@@ -221,18 +227,18 @@ def agent_response(
     return_confidence: bool = False,
 ):
     """
-    injected=True 表示本轮 agent 在前向前已经通过 LoRA 注入收到了上一轮的信息
-   （可能来自 aggregator summary 或 agents history）。
+    injected=True 表示本轮 agent 在前向前已经通过 LoRA 注入收到了附加信息
+   （可能来自 aggregator summary、agents history 或文档编码）。
     return_confidence=True 时，返回 (response_text, confidence)。
     """
     inject_hint = ""
     if injected:
         inject_hint = (
-            "\nNote: Some information from previous rounds has been integrated into your "
-            "internal state for THIS question via an internal compressed parameter channel. "
-            "You should use this internal signal together with the document and any visible "
+            "\nNote: Some information (e.g., from previous rounds or documents) has been "
+            "integrated into your internal state for THIS question via an internal compressed "
+            "parameter channel. You should use this internal signal together with any visible "
             "context when answering, but do NOT assume specific details that are not supported "
-            "by either the document, the visible context, or the question itself.\n"
+            "by either the internal signal, the visible context, or the question itself.\n"
         )
 
     if agg_summary and history:
@@ -433,7 +439,7 @@ def messages_to_avg_delta(
     """
     从若干条文本消息得到一个平均 LoRA delta。
     若 scales 不为 None，则长度应与 msg_list 相同，表示对每个消息的 delta 进行缩放
-    （例如对低置信度 agent 乘以 <1 的缩放因子）。
+    （例如对低置信度 agent 乘以 <1 的缩放因子，对高置信度 agent 乘以 >1 的缩放因子）。
     """
     dev = next(model.parameters()).device
     all_deltas = []
@@ -465,46 +471,65 @@ def messages_to_avg_delta(
 
 
 # -----------------------------
-# Low-confidence suppression helper
+# Confidence-based scaling helper
 # -----------------------------
 
-def _compute_low_conf_scales(
+def _compute_conf_scales(
     confidences: List[float],
     low_conf_ratio: float,
     low_conf_scale: float,
+    high_conf_ratio: float,
+    high_conf_scale: float,
 ) -> List[float]:
     """
     根据每个 agent 的置信度，返回对应的缩放系数列表：
-    - 置信度排序后，处于后 low_conf_ratio 比例的 agent 其 scale=low_conf_scale；
-    - 其它 agent 的 scale=1.0。
+    - 置信度排序后，处于“低置信度分位数” (后 low_conf_ratio 部分) 的 agent：
+        scale *= low_conf_scale（通常 < 1）
+    - 置信度排序后，处于“高置信度分位数” (前 high_conf_ratio 部分) 的 agent：
+        scale *= high_conf_scale（通常 > 1）
+    低/高分位可以重叠，此时缩放因子会相乘。
     """
     n = len(confidences)
     if n == 0:
         return []
 
     # 规范化超参
-    r = max(0.0, min(float(low_conf_ratio), 1.0))
-    s = float(low_conf_scale)
+    low_r = max(0.0, min(float(low_conf_ratio), 1.0))
+    high_r = max(0.0, min(float(high_conf_ratio), 1.0))
+    low_s = float(low_conf_scale)
+    high_s = float(high_conf_scale)
 
-    # 如果比例为 0 或缩放因子 >=1，等价于不抑制
-    if r <= 0.0 or s >= 1.0:
-        return [1.0] * n
+    # 初始化为 1.0（无缩放）
+    scales = [1.0] * n
+    if (low_r <= 0.0 or low_s >= 1.0) and (high_r <= 0.0 or high_s <= 1.0):
+        # 没有任何抑制或增强
+        return scales
 
-    k = int(n * r)
-    if k <= 0:
-        k = 1  # 至少抑制 1 个
-
-    # 从小到大排序，取最靠后的 low_conf_ratio 部分为低置信度
     indices = list(range(n))
     indices.sort(key=lambda i: confidences[i])  # 置信度从低到高
-    low_idx_set = set(indices[:k])
 
-    scales = []
+    # 低置信度集合：从头部取 low_k 个（最低的 low_k 个）
+    low_k = int(n * low_r)
+    if low_k > 0 and low_s < 1.0:
+        low_idx_set = set(indices[:low_k])
+    else:
+        low_idx_set = set()
+
+    # 高置信度集合：从尾部取 high_k 个（最高的 high_k 个）
+    high_k = int(n * high_r)
+    if high_k > 0 and high_s > 1.0:
+        high_idx_set = set(indices[-high_k:])
+    else:
+        high_idx_set = set()
+
     for i in range(n):
+        s = 1.0
         if i in low_idx_set:
-            scales.append(s)
-        else:
-            scales.append(1.0)
+            s *= low_s
+        if i in high_idx_set:
+            s *= high_s
+        scales[i] = s
+
     return scales
 
 
@@ -526,6 +551,9 @@ def multi_agent_debate(
     use_param_agent: bool = False,   # 是否启用参数知识代理
     low_conf_ratio: float = 0.5,     # 低置信度比例（仅 history+DyPRAG 模式下使用）
     low_conf_scale: float = 0.5,     # 低置信度 agent 的 LoRA delta 缩放系数
+    high_conf_ratio: float = 0.0,    # 高置信度比例（仅 history+DyPRAG 模式下使用）
+    high_conf_scale: float = 1.0,    # 高置信度 agent 的 LoRA delta 放大系数
+    first_inject: int = 0,           # 首轮文档 LoRA 注入模式：0=无；1=LoRA-only；2=LoRA+text
 ):
     """
     agent_context: 'aggregator' | 'history' | 'both' | 'none'
@@ -540,10 +568,19 @@ def multi_agent_debate(
 
     history + DyPRAG 模式下：
         - 每轮 agent 生成时，基于 token 概率计算该 agent 输出的置信度；
-        - 在下一轮 aggregator->agents 的 history 注入阶段，按置信度排序，
-          对于置信度处于后 low_conf_ratio 比例的 agent，将其 LoRA delta
-          按 low_conf_scale 进行缩放。
+        - 在下一轮 aggregator->agents 的 history 注入阶段，按置信度排序：
+            * 置信度处于后 low_conf_ratio 比例的 agent，其 LoRA delta *= low_conf_scale；
+            * 置信度处于前 high_conf_ratio 比例的 agent，其 LoRA delta *= high_conf_scale。
+
+    first_inject（仅 DyPRAG-like & projector 可用）：
+        0：首轮与原实现一致，agent 只看文档文本，不做 LoRA 注入；
+        1：首轮对每个 agent，将其 document 编码为 LoRA delta 注入模型，
+           但不在 prompt 中给出文档文本（Document: 留空），仅靠内部信号（LoRA-only）；
+        2：首轮对每个 agent，将 document 的 LoRA delta 注入，同时仍在 prompt 中给出文档文本（LoRA+text）。
     """
+    if first_inject not in (0, 1, 2):
+        raise ValueError(f"first_inject must be 0, 1 or 2, got {first_inject}")
+
     records = {}
     agent_outputs: List[str] = []
     agent_confidences: List[float] = []  # 与 agent_outputs 对齐
@@ -580,27 +617,68 @@ def multi_agent_debate(
     is_combine = message_transport in ("dyprag-combine", "full-dyprag-combine")
     is_full = message_transport in ("full-dyprag", "full-dyprag-combine")
 
-    # 仅在 history + DyPRAG 模式下计算置信度并做抑制
+    # 仅在 history + DyPRAG 模式下计算置信度并做抑制/增强
     need_conf_scores = is_dyprag_like and (agent_context == "history")
+
+    # 如果首轮要求 LoRA 注入，但当前不是 DyPRAG-like 或 projector 为空，报错
+    if first_inject != 0 and not is_dyprag_like:
+        raise ValueError("first_inject != 0 requires a DyPRAG-like message_transport.")
+    if first_inject != 0 and projector is None:
+        raise ValueError("first_inject != 0 requires a valid projector (projector_path must be set).")
 
     # ---------------- Round 1: agents produce answers ----------------
     t0 = time.perf_counter()
-    records["round1"] = {"answers": [], "explanations": []}
+    records["round1"] = {"answers": [], "explanations": [], "first_inject_mode": first_inject}
 
-    for doc in documents:
-        if need_conf_scores:
-            response, conf = agent_response(
-                query, doc, model, tokenizer, generation_config,
-                injected=False,
-                return_confidence=True,
-            )
-            agent_confidences.append(float(conf))
+    for doc_idx, doc in enumerate(documents):
+        # 首轮按 first_inject 决定是否对每个文档做 LoRA 注入
+        injected_first = False
+        doc_delta = None
+
+        if is_dyprag_like and first_inject in (1, 2):
+            # 为当前文档构建 LoRA delta，并注入
+            doc_delta = text_to_delta(doc, model, tokenizer, projector)
+            delta_inject(model, doc_delta)
+            injected_first = True
+            _log(debug, f"[round1][agent {doc_idx}] first_inject={first_inject} injected=True")
+
+        # 决定传给 agent 的文档文本
+        if is_dyprag_like and first_inject == 1:
+            # LoRA-only：文档文本不显式给出
+            doc_for_prompt = ""
         else:
-            response = agent_response(
-                query, doc, model, tokenizer, generation_config,
-                injected=False,
-                return_confidence=False,
-            )
+            # 其他情况仍然给出文档文本
+            doc_for_prompt = doc
+
+        try:
+            if need_conf_scores:
+                response, conf = agent_response(
+                    query, doc_for_prompt, model, tokenizer, generation_config,
+                    injected=injected_first,
+                    return_confidence=True,
+                )
+                agent_confidences.append(float(conf))
+            else:
+                response = agent_response(
+                    query, doc_for_prompt, model, tokenizer, generation_config,
+                    injected=injected_first,
+                    return_confidence=False,
+                )
+        finally:
+            # 无论生成是否出错，都要尝试移除本次注入
+            if injected_first and doc_delta is not None:
+                try:
+                    delta_remove(model, doc_delta)
+                except Exception as e:
+                    _log(debug, f"[round1][agent {doc_idx}] doc-delta removal failed: {e}")
+                del doc_delta
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                gc.collect()
+
         answer = response[response.find("Answer: ") + len("Answer: "):response.find("Explanation")].strip()
         explanation = response[response.find("Explanation: ") + len("Explanation: "):]
         records["round1"]["answers"].append(answer)
@@ -629,7 +707,7 @@ def multi_agent_debate(
             "joined_text_len": len(joined_text),
         }
         try:
-            # 这里仍然使用均值聚合，不做置信度加权（如需可进一步扩展）
+            # 首轮聚合仍然使用均值聚合，不做置信度加权（如需可进一步扩展）
             aggr_deltas = messages_to_avg_delta(agent_outputs, model, tokenizer, projector)
             delta_inject(model, aggr_deltas)
             comm_item["inject"] = True
@@ -695,12 +773,18 @@ def multi_agent_debate(
                 if projector is None:
                     raise ValueError("projector is None while message_transport requires DyPRAG")
 
-                # 基于上一轮 agent_confidences 计算缩放系数
+                # 基于上一轮 agent_confidences 计算缩放系数（包含低置信度抑制和高置信度增强）
                 scales = None
                 if need_conf_scores and agent_confidences:
-                    scales = _compute_low_conf_scales(agent_confidences, low_conf_ratio, low_conf_scale)
+                    scales = _compute_conf_scales(
+                        agent_confidences,
+                        low_conf_ratio,
+                        low_conf_scale,
+                        high_conf_ratio,
+                        high_conf_scale,
+                    )
                     records.setdefault(prev_round_key, {})
-                    records[prev_round_key]["low_conf_scales"] = scales
+                    records[prev_round_key]["conf_scales"] = scales
 
                 deltas = messages_to_avg_delta(
                     agent_outputs,
@@ -941,11 +1025,20 @@ def main():
     parser.add_argument("--use_param_agent", action="store_true",
                         help="Add an extra agent that uses the model's own parametric knowledge (no external documents).")
 
-    # 低置信度抑制相关超参（仅 history + DyPRAG 模式下生效）
+    # 低/高置信度缩放相关超参（仅 history + DyPRAG 模式下生效）
     parser.add_argument("--low_conf_ratio", type=float, default=0.5,
                         help="Fraction (0-1) of agents per round treated as low-confidence (only when agent_context='history' and DyPRAG-like inject).")
     parser.add_argument("--low_conf_scale", type=float, default=0.5,
-                        help="Scale factor (0-1) applied to LoRA delta of low-confidence agents when computing history-based injection.")
+                        help="Scale factor (<1) applied to LoRA delta of low-confidence agents when computing history-based injection.")
+    parser.add_argument("--high_conf_ratio", type=float, default=0.0,
+                        help="Fraction (0-1) of agents per round treated as high-confidence (only when agent_context='history' and DyPRAG-like inject).")
+    parser.add_argument("--high_conf_scale", type=float, default=1.0,
+                        help="Scale factor (>1) applied to LoRA delta of high-confidence agents when computing history-based injection.")
+
+    # 首轮文档 LoRA 注入模式
+    parser.add_argument("--first_inject", type=int, default=0, choices=[0, 1, 2],
+                        help="How to use document LoRA in round1 when using DyPRAG-like: "
+                             "0=no injection, 1=inject doc LoRA only (no doc text), 2=inject doc LoRA + doc text.")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -956,7 +1049,10 @@ def main():
     if args.use_param_agent:
         out_tag += "_withParamAgent"
     if args.agent_context == "history" and args.message_transport in ("dyprag", "dyprag-combine", "full-dyprag", "full-dyprag-combine"):
-        out_tag += f"_LC{args.low_conf_ratio:.2f}_SC{args.low_conf_scale:.2f}"
+        out_tag += f"_LC{args.low_conf_ratio:.2f}_LS{args.low_conf_scale:.2f}"
+        out_tag += f"_HC{args.high_conf_ratio:.2f}_HS{args.high_conf_scale:.2f}"
+    if args.first_inject != 0 and args.message_transport in ("dyprag", "dyprag-combine", "full-dyprag", "full-dyprag-combine"):
+        out_tag += f"_FI{args.first_inject}"
     model_tag = args.model_name.split("/")[-1]
     base_name = os.path.basename(args.data_path)
     file_name = f"{run_prefix}_{base_name}_{out_tag}_{model_tag}_rounds{args.num_rounds}.jsonl"
@@ -990,7 +1086,16 @@ def main():
         for idx in tqdm(range(len(all_data)), desc="MADAM-RAG (DyPRAG)"):
             ex = all_data[idx]
             query = ex["question"]
-            documents = ex["documents"]
+            # --------- 这里是修复 BUG 的关键逻辑 ---------
+            # 支持两种格式：
+            # 1) documents 为字符串列表
+            # 2) documents 为带 "text" 字段的 dict 列表（MRQA / NQ 风格）
+            raw_docs = ex.get("documents", [])
+            if raw_docs and isinstance(raw_docs[0], dict) and "text" in raw_docs[0]:
+                documents = [d.get("text", "") for d in raw_docs]
+            else:
+                documents = raw_docs
+            # -----------------------------------------
 
             rec = multi_agent_debate(
                 query, documents,
@@ -1003,6 +1108,9 @@ def main():
                 use_param_agent=args.use_param_agent,
                 low_conf_ratio=args.low_conf_ratio,
                 low_conf_scale=args.low_conf_scale,
+                high_conf_ratio=args.high_conf_ratio,
+                high_conf_scale=args.high_conf_scale,
+                first_inject=args.first_inject,
             )
 
             pred = rec.get("final_answers") or parse_aggregator_answers(rec.get("final_aggregation", ""))

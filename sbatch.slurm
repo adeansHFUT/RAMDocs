@@ -36,7 +36,7 @@ CMD=(
   python -u madam-dyprag.py
   --model_name qwen2.5-1.5b-instruct
   --data_path /share/home/yangjj/RAMDocs/RAMDocs_test.jsonl
-  --num_rounds 5
+  --num_rounds 3
   --message_transport dyprag-combine
   --projector_path /share/home/yangjj/DyPRAG/projector/qwen2.5-1.5b-instruct_hidden32_sample1.0_lr1e-05_augllama3.2-1b-instruct
   --inference_epoch 1
@@ -45,8 +45,10 @@ CMD=(
   --agent_context history
   --debug
   #--use_param_agent
-  --low_conf_ratio 0.2
-  --low_conf_scale 0.5
+  --low_conf_ratio 0.4
+  --low_conf_scale 0.8
+  --high_conf_ratio 0.2
+  --high_conf_scale 1.2
 )
 
 # --------------------
