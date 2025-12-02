@@ -42,6 +42,44 @@ from utils import get_model, delta_inject, delta_remove
 from projector import ParameterTranslator
 from peft import LoraConfig, get_peft_model
 
+# -----------------------------
+# LoRA 高层注入辅助
+# -----------------------------
+LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
+
+def keep_top_layer_deltas(deltas, num_layers: int, keep_last_k: int):
+    """
+    仅保留最后 K 层 (top-K) 的 LoRA delta，其余层不注入。
+    - deltas: ParameterTranslator 输出的 dict[str, Tensor]
+    - num_layers: 模型总层数 (model.config.num_hidden_layers)
+    - keep_last_k: 保留的高层数，例如 4 -> 只保留 [L-4, ..., L-1]
+    """
+    if deltas is None:
+        return None
+    if num_layers is None:
+        return deltas
+    if keep_last_k <= 0 or keep_last_k >= num_layers:
+        # K <= 0: 全部丢弃不太合理，这里选择“不过滤”
+        # K >= L: 相当于全层注入
+        return deltas
+
+    threshold = num_layers - keep_last_k
+    new_deltas = {}
+    for key, value in deltas.items():
+        m = LAYER_ID_RE.search(key)
+        if m:
+            layer_id = int(m.group(1))
+            # 只保留最后 K 层
+            if layer_id >= threshold:
+                new_deltas[key] = value
+            else:
+                # 低层直接跳过，不注入
+                continue
+        else:
+            # 没写层号（比如某些 bias），保留
+            new_deltas[key] = value
+    return new_deltas
+
 
 # -----------------------------
 # Simple timestamp logger
@@ -611,19 +649,22 @@ def multi_agent_debate(
     high_conf_ratio: float = 0.0,    # 高置信度比例（仅 history+DyPRAG 模式下使用）
     high_conf_scale: float = 1.0,    # 高置信度 agent 的 LoRA delta 放大系数
     first_inject: int = 0,           # 首轮文档 LoRA 注入模式：0=无；1=LoRA-only；2=LoRA+text
-    # 新增：缩放 & 轮次调度
+    # 缩放 & 轮次调度
     scale_mode: str = "step",        # 'step' 或 'continuous'
     round_aware_scaling: bool = False,
     continuous_s_min: float = 0.3,
     continuous_s_max: float = 1.5,
     continuous_temperature: float = 5.0,
-    # 新增：动态活跃 agents
+    # 动态活跃 agents
     dynamic_agents: bool = False,
     dynamic_agent_frac: float = 1.0,
     dynamic_agent_min: int = 1,
-    # 新增：停止判据
+    # 停止判据
     stop_mode: str = "agent_answers",  # 'agent_answers' | 'aggregator' | 'cluster'
     cluster_stable_tol: float = 0.1,
+    # >>> 新增：仅高层注入相关参数 <<<
+    high_layer_only: bool = False,
+    high_layer_k: int = 4,
 ):
     """
     agent_context: 'aggregator' | 'history' | 'both' | 'none'
@@ -648,8 +689,10 @@ def multi_agent_debate(
 
     dynamic_agents:
         若为 True，使用每轮的置信度对 active agents 做裁剪，只保留 top-k 进入下一轮。
-        注意：dynamic_agents 本身和 message_transport/text/DyPRAG 解耦，
-        即 text+history / text+aggregator 也可以开启动态裁剪。
+
+    high_layer_only:
+        若为 True，则所有 LoRA 注入（doc->agent, agents->aggregator, aggregator->agents）
+        都仅作用于最后 high_layer_k 个 transformer layer。
     """
     if first_inject not in (0, 1, 2):
         raise ValueError(f"first_inject must be 0, 1 or 2, got {first_inject}")
@@ -663,6 +706,9 @@ def multi_agent_debate(
     agent_confidences: List[float] = []  # 与 agent_outputs 对齐
     round_times = {}
     comm_debug = {"rounds": []}
+
+    # 模型总层数，用于高层过滤
+    num_layers = getattr(getattr(model, "config", None), "num_hidden_layers", None)
 
     # --- 构造本地 documents 列表，并可选地追加 param-agent 文档 ---
     documents = list(documents)  # 防止原列表被外部复用
@@ -725,6 +771,10 @@ def multi_agent_debate(
         if is_dyprag_like and first_inject in (1, 2):
             # 为当前文档构建 LoRA delta，并注入
             doc_delta = text_to_delta(doc, model, tokenizer, projector)
+            # 仅高层注入
+            if high_layer_only and num_layers is not None:
+                doc_delta = keep_top_layer_deltas(doc_delta, num_layers, high_layer_k)
+
             delta_inject(model, doc_delta)
             injected_first = True
             _log(debug, f"[round1][agent {doc_idx}] first_inject={first_inject} injected=True")
@@ -793,6 +843,10 @@ def multi_agent_debate(
         }
         try:
             aggr_deltas = messages_to_avg_delta(agent_outputs, model, tokenizer, projector)
+            # 仅高层注入
+            if high_layer_only and num_layers is not None:
+                aggr_deltas = keep_top_layer_deltas(aggr_deltas, num_layers, high_layer_k)
+
             delta_inject(model, aggr_deltas)
             comm_item["inject"] = True
             _log(debug, f"[agents->aggregator] injected=True")
@@ -875,6 +929,10 @@ def multi_agent_debate(
                 if projector is None:
                     raise ValueError("projector is None while message_transport requires DyPRAG")
                 deltas = text_to_delta(prev_agg, model, tokenizer, projector)
+                # 仅高层注入
+                if high_layer_only and num_layers is not None:
+                    deltas = keep_top_layer_deltas(deltas, num_layers, high_layer_k)
+
                 delta_inject(model, deltas)
                 injected = True
                 agg2agent_mode = "summary"
@@ -922,6 +980,10 @@ def multi_agent_debate(
                     projector,
                     scales=scales,
                 )
+                # 仅高层注入
+                if high_layer_only and num_layers is not None:
+                    deltas = keep_top_layer_deltas(deltas, num_layers, high_layer_k)
+
                 delta_inject(model, deltas)
                 injected = True
                 agg2agent_mode = "history"
@@ -1059,6 +1121,10 @@ def multi_agent_debate(
             }
             try:
                 aggr_deltas = messages_to_avg_delta(agent_outputs, model, tokenizer, projector)
+                # 仅高层注入
+                if high_layer_only and num_layers is not None:
+                    aggr_deltas = keep_top_layer_deltas(aggr_deltas, num_layers, high_layer_k)
+
                 delta_inject(model, aggr_deltas)
                 comm_item["inject"] = True
                 _log(debug, f"[agents->aggregator] injected=True")
@@ -1160,7 +1226,6 @@ def multi_agent_debate(
     records["comm_debug"] = comm_debug
     return records
 
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -1210,7 +1275,7 @@ def main():
                         help="How to use document LoRA in round1 when using DyPRAG-like: "
                              "0=no injection, 1=inject doc LoRA only (no doc text), 2=inject doc LoRA + doc text.")
 
-    # 新增：缩放模式 & round-aware scaling
+    # 缩放模式 & round-aware scaling
     parser.add_argument("--scale_mode", type=str, default="step",
                         choices=["step", "continuous"],
                         help="How to map confidences to per-agent LoRA scales in history+DyPRAG.")
@@ -1223,7 +1288,7 @@ def main():
     parser.add_argument("--continuous_temperature", type=float, default=5.0,
                         help="Temperature for logistic continuous scaling.")
 
-    # 新增：动态活跃 agents
+    # 动态活跃 agents
     parser.add_argument("--dynamic_agents", action="store_true",
                         help="Enable dynamic pruning of low-confidence agents across rounds.")
     parser.add_argument("--dynamic_agent_frac", type=float, default=1.0,
@@ -1231,12 +1296,18 @@ def main():
     parser.add_argument("--dynamic_agent_min", type=int, default=1,
                         help="Minimum number of active agents per round when dynamic_agents is enabled.")
 
-    # 新增：停止判据
+    # 停止判据
     parser.add_argument("--stop_mode", type=str, default="agent_answers",
                         choices=["agent_answers", "aggregator", "cluster"],
                         help="Stopping criterion for multi-round debate.")
     parser.add_argument("--cluster_stable_tol", type=float, default=0.1,
                         help="Tolerance on answer-cluster frequency difference for 'cluster' stop_mode.")
+
+    # >>> 新增：仅高层注入相关 CLI 参数 <<<
+    parser.add_argument("--high_layer_only", action="store_true",
+                        help="If set, only inject LoRA messages into the top-K transformer layers.")
+    parser.add_argument("--high_layer_k", type=int, default=4,
+                        help="Number of top transformer layers to inject when high_layer_only is enabled.")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -1261,6 +1332,9 @@ def main():
         out_tag += f"_STOP-{args.stop_mode}"
         if args.stop_mode == "cluster":
             out_tag += f"_CT{args.cluster_stable_tol:.2f}"
+    # >>> 新增：输出 tag 标注高层注入设置 <<<
+    if args.high_layer_only:
+        out_tag += f"_HL{args.high_layer_k}"
 
     model_tag = args.model_name.split("/")[-1]
     base_name = os.path.basename(args.data_path)
@@ -1326,6 +1400,9 @@ def main():
                 dynamic_agent_min=args.dynamic_agent_min,
                 stop_mode=args.stop_mode,
                 cluster_stable_tol=args.cluster_stable_tol,
+                # >>> 把高层注入参数传进去 <<<
+                high_layer_only=args.high_layer_only,
+                high_layer_k=args.high_layer_k,
             )
 
             pred = rec.get("final_answers") or parse_aggregator_answers(rec.get("final_aggregation", ""))
@@ -1371,7 +1448,6 @@ def main():
         except Exception:
             pass
         torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
