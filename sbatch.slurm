@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=7:00:00
 #SBATCH -o logs/%x-%j.out
 
 # --------------------
@@ -37,18 +37,30 @@ CMD=(
   --model_name qwen2.5-1.5b-instruct
   --data_path /share/home/yangjj/RAMDocs/RAMDocs_test.jsonl
   --num_rounds 3
-  --message_transport dyprag-combine
+  --message_transport text
   --projector_path /share/home/yangjj/DyPRAG/projector/qwen2.5-1.5b-instruct_hidden32_sample1.0_lr1e-05_augllama3.2-1b-instruct
   --inference_epoch 1
   --lora_rank 2
   --projector_p 32
-  --agent_context history
+  --agent_context aggregator
   --debug
+  --first_inject 0
   #--use_param_agent
-  --low_conf_ratio 0.4
-  --low_conf_scale 0.8
-  --high_conf_ratio 0.2
-  --high_conf_scale 1.2
+  --scale_mode continuous # step / continuous
+  --low_conf_ratio 0.75
+  --low_conf_scale 0.75
+  --high_conf_ratio 0
+  --high_conf_scale 1
+  --continuous_s_min 0.5
+  --continuous_s_max 1.0 
+  --continuous_temperature 2.0 #控制的是“置信度 → 缩放系数”的曲线有多陡、多“硬”。
+  --round_aware_scaling  #后面round缩放得更狠
+  --dynamic_agents  # 是否动态剪枝agent
+  --dynamic_agent_frac 0.75 #表示每轮只保留 top n 置信度最高的 agents；
+  --dynamic_agent_min 2 #保证至少保留 n个。
+  --stop_mode agent_answers #保持原来 per-agent 答案一致性（无动态时完全兼容旧逻辑，有动态时退化为答案集合一致）。
+  #--stop_mode aggregator #看聚合器两轮的 answers set 是否稳定。
+  #--stop_mode cluster #看 agent 答案簇结构是否稳定（key 一致且相对频率变化小于 --cluster_stable_tol）
 )
 
 # --------------------
