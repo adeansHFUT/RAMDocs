@@ -19,6 +19,8 @@ MADAM-RAG with DyPRAG-style LoRA-as-message (delta inject/remove)
     - 1：首轮仅注入文档 LoRA，不给文档文本（LoRA-only）
     - 2：首轮既注入文档 LoRA，也给文档文本（LoRA+text）
 + 连续映射 / round-aware scaling / 动态活跃 agents / aggregator&cluster 停止判据
++ 新增 scale_mode=no：显式关闭基于置信度的缩放（所有 scale=1）
++ 新增 stop_mode=agent_answers_set：基于答案集合稳定性收敛（与 dynamic_agents 解耦）
 
 依赖：
   - utils.py      : get_model, delta_inject, delta_remove
@@ -650,7 +652,7 @@ def multi_agent_debate(
     high_conf_scale: float = 1.0,    # 高置信度 agent 的 LoRA delta 放大系数
     first_inject: int = 0,           # 首轮文档 LoRA 注入模式：0=无；1=LoRA-only；2=LoRA+text
     # 缩放 & 轮次调度
-    scale_mode: str = "step",        # 'step' 或 'continuous'
+    scale_mode: str = "step",        # 'no' | 'step' | 'continuous'
     round_aware_scaling: bool = False,
     continuous_s_min: float = 0.3,
     continuous_s_max: float = 1.5,
@@ -660,7 +662,7 @@ def multi_agent_debate(
     dynamic_agent_frac: float = 1.0,
     dynamic_agent_min: int = 1,
     # 停止判据
-    stop_mode: str = "agent_answers",  # 'agent_answers' | 'aggregator' | 'cluster'
+    stop_mode: str = "agent_answers",  # 'agent_answers' | 'agent_answers_set' | 'aggregator' | 'cluster'
     cluster_stable_tol: float = 0.1,
     # >>> 新增：仅高层注入相关参数 <<<
     high_layer_only: bool = False,
@@ -679,8 +681,9 @@ def multi_agent_debate(
     history + DyPRAG 模式下：
         - 每轮 agent 生成时，基于 token 概率计算该 agent 输出的置信度；
         - 在下一轮 aggregator->agents 的 history 注入阶段，按置信度计算 LoRA scale：
-            * 分段模式：低/高置信分段；
-            * 连续模式：logistic 映射。
+            * scale_mode='step'：低/高置信分段；
+            * scale_mode='continuous'：logistic 映射；
+            * scale_mode='no'：不做缩放，所有 scale=1。
 
     first_inject（仅 DyPRAG-like & projector 可用）：
         0：首轮与原实现一致，agent 只看文档文本，不做 LoRA 注入；
@@ -693,13 +696,27 @@ def multi_agent_debate(
     high_layer_only:
         若为 True，则所有 LoRA 注入（doc->agent, agents->aggregator, aggregator->agents）
         都仅作用于最后 high_layer_k 个 transformer layer。
+
+    scale_mode:
+        'no'         : 显式关闭缩放（所有 scale=1）；
+        'step'       : 使用 low/high_conf_ratio & *_scale 的分段缩放；
+        'continuous' : 使用 logistic 映射到 [continuous_s_min, continuous_s_max]。
+
+    stop_mode:
+        'agent_answers'      : 原始 per-agent 子串匹配 + 在 agent 数变化时用集合稳定；
+        'agent_answers_set'  : 始终用答案集合稳定性判断（与 dynamic_agents 解耦）；
+        'aggregator'         : 聚合器答案集合稳定；
+        'cluster'            : agent 答案簇分布稳定。
     """
     if first_inject not in (0, 1, 2):
         raise ValueError(f"first_inject must be 0, 1 or 2, got {first_inject}")
-    if scale_mode not in ("step", "continuous"):
-        raise ValueError(f"scale_mode must be 'step' or 'continuous', got {scale_mode}")
-    if stop_mode not in ("agent_answers", "aggregator", "cluster"):
-        raise ValueError(f"stop_mode must be one of 'agent_answers', 'aggregator', 'cluster', got {stop_mode}")
+    if scale_mode not in ("no", "step", "continuous"):
+        raise ValueError(f"scale_mode must be 'no', 'step' or 'continuous', got {scale_mode}")
+    if stop_mode not in ("agent_answers", "agent_answers_set", "aggregator", "cluster"):
+        raise ValueError(
+            "stop_mode must be one of 'agent_answers', 'agent_answers_set', 'aggregator', 'cluster', "
+            f"got {stop_mode}"
+        )
 
     records = {}
     agent_outputs: List[str] = []
@@ -941,7 +958,9 @@ def multi_agent_debate(
                     raise ValueError("projector is None while message_transport requires DyPRAG")
 
                 scales = None
-                if need_conf_scores and agent_confidences:
+
+                # 仅在 scale_mode != 'no' 时才根据置信度计算缩放系数
+                if need_conf_scores and agent_confidences and scale_mode != "no":
                     if scale_mode == "continuous":
                         if round_aware_scaling and num_rounds > 1:
                             progress = float(t) / float(num_rounds - 1)
@@ -956,7 +975,7 @@ def multi_agent_debate(
                             s_max_eff,
                             continuous_temperature,
                         )
-                    else:
+                    else:  # 'step'
                         eff_low = low_conf_scale
                         eff_high = high_conf_scale
                         if round_aware_scaling and num_rounds > 1:
@@ -970,15 +989,21 @@ def multi_agent_debate(
                             high_conf_ratio,
                             eff_high,
                         )
+
                     records.setdefault(prev_round_key, {})
                     records[prev_round_key]["conf_scales"] = scales
+
+                # 显式记录“没有缩放”（所有 scale=1），方便之后分析
+                if scale_mode == "no" and need_conf_scores and agent_confidences:
+                    records.setdefault(prev_round_key, {})
+                    records[prev_round_key]["conf_scales"] = [1.0] * len(agent_outputs)
 
                 deltas = messages_to_avg_delta(
                     agent_outputs,
                     model,
                     tokenizer,
                     projector,
-                    scales=scales,
+                    scales=scales,   # 当 scale_mode='no' 时，这里是 None，等价于不缩放
                 )
                 # 仅高层注入
                 if high_layer_only and num_layers is not None:
@@ -1167,13 +1192,24 @@ def multi_agent_debate(
             prev_set = {a for a in prev_ans if a}
             curr_set = {a for a in curr_ans if a}
             converged = (prev_set == curr_set and len(curr_set) > 0)
+
         elif stop_mode == "cluster":
             prev_clusters = _build_answer_clusters(records[prev_round_key]["answers"])
             curr_clusters = _build_answer_clusters(records[round_key]["answers"])
             converged = _clusters_stable(prev_clusters, curr_clusters, cluster_stable_tol)
-        else:  # 'agent_answers'
+
+        elif stop_mode == "agent_answers_set":
+            # 新收敛判据：始终用答案集合稳定性
             prev_answers = records[prev_round_key]["answers"]
             curr_answers = records[round_key]["answers"]
+            prev_set = {normalize_answer(a) for a in prev_answers if a.strip()}
+            curr_set = {normalize_answer(a) for a in curr_answers if a.strip()}
+            converged = (prev_set == curr_set and len(curr_set) > 0)
+
+        else:  # stop_mode == "agent_answers"
+            prev_answers = records[prev_round_key]["answers"]
+            curr_answers = records[round_key]["answers"]
+
             if len(prev_answers) == len(curr_answers) and not dynamic_agents:
                 # 保持原始实现（逐 agent 子串匹配）以最大限度兼容旧逻辑
                 flag = True
@@ -1277,8 +1313,11 @@ def main():
 
     # 缩放模式 & round-aware scaling
     parser.add_argument("--scale_mode", type=str, default="step",
-                        choices=["step", "continuous"],
-                        help="How to map confidences to per-agent LoRA scales in history+DyPRAG.")
+                        choices=["no", "step", "continuous"],
+                        help=("How to map confidences to per-agent LoRA scales in history+DyPRAG. "
+                              "'no' disables scaling (all scales=1); "
+                              "'step' uses piecewise scaling via low/high_conf_*; "
+                              "'continuous' uses a logistic continuous mapping."))
     parser.add_argument("--round_aware_scaling", action="store_true",
                         help="If set, make LoRA scaling more aggressive in later rounds.")
     parser.add_argument("--continuous_s_min", type=float, default=0.3,
@@ -1298,8 +1337,13 @@ def main():
 
     # 停止判据
     parser.add_argument("--stop_mode", type=str, default="agent_answers",
-                        choices=["agent_answers", "aggregator", "cluster"],
-                        help="Stopping criterion for multi-round debate.")
+                        choices=["agent_answers", "agent_answers_set", "aggregator", "cluster"],
+                        help=("Stopping criterion for multi-round debate. "
+                              "'agent_answers' uses per-agent substring matching (with set fallback); "
+                              "'agent_answers_set' uses answer-set stability; "
+                              "'aggregator' uses aggregator answer stability; "
+                              "'cluster' uses answer-cluster stability."))
+
     parser.add_argument("--cluster_stable_tol", type=float, default=0.1,
                         help="Tolerance on answer-cluster frequency difference for 'cluster' stop_mode.")
 
@@ -1365,6 +1409,8 @@ def main():
 
     # run end-to-end (no resume) and overwrite output
     total_em, counted = 0, 0
+    reached_round3 = 0  # <<< 新增：统计进入 round3 的 case 数量
+
     with open(output_path, "w", encoding="utf-8") as out:
         for idx in tqdm(range(len(all_data)), desc="MADAM-RAG (DyPRAG)"):
             ex = all_data[idx]
@@ -1405,6 +1451,10 @@ def main():
                 high_layer_k=args.high_layer_k,
             )
 
+            # 统计是否进入 round3：只要记录里存在 round3 key，就认为跑到了第三轮
+            if "round3" in rec:
+                reached_round3 += 1
+
             pred = rec.get("final_answers") or parse_aggregator_answers(rec.get("final_aggregation", ""))
             gold = ex.get("gold_answers", [])
             em = em_score(pred, gold) if gold is not None else None
@@ -1433,6 +1483,8 @@ def main():
 
     if counted:
         print(f"[EM] {total_em}/{counted} = {total_em / counted * 100:.2f}%")
+    # 在 EM 之后输出：有多少条 case 进入了 round3（没有在 round2 提前早停）
+    print(f"[Round3] {reached_round3}/{len(all_data)} cases reached round3 (did not stop by round2).")
     print(f"[Output] {output_path}")
 
     # cleanup
