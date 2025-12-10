@@ -664,9 +664,11 @@ def multi_agent_debate(
     # 停止判据
     stop_mode: str = "agent_answers",  # 'agent_answers' | 'agent_answers_set' | 'aggregator' | 'cluster'
     cluster_stable_tol: float = 0.1,
-    # >>> 新增：仅高层注入相关参数 <<<
+    # >>> 仅高层注入相关参数 <<<
     high_layer_only: bool = False,
     high_layer_k: int = 4,
+    # >>> 新增：控制收敛时 final aggregation 的选择 <<<
+    final_agg_mode: str = "curr",  # 'prev' | 'curr'
 ):
     """
     agent_context: 'aggregator' | 'history' | 'both' | 'none'
@@ -707,6 +709,12 @@ def multi_agent_debate(
         'agent_answers_set'  : 始终用答案集合稳定性判断（与 dynamic_agents 解耦）；
         'aggregator'         : 聚合器答案集合稳定；
         'cluster'            : agent 答案簇分布稳定。
+
+    final_agg_mode:
+        'prev' : 收敛时使用收敛前一轮的 aggregator 输出作为最终答案；
+                 对于非 'aggregator' stop_mode，可在聚合前判断收敛，省掉本轮 aggregation。
+        'curr' : 收敛时使用当前这一轮的 aggregator 输出作为最终答案；
+                 与现有新版行为一致。
     """
     if first_inject not in (0, 1, 2):
         raise ValueError(f"first_inject must be 0, 1 or 2, got {first_inject}")
@@ -717,6 +725,8 @@ def multi_agent_debate(
             "stop_mode must be one of 'agent_answers', 'agent_answers_set', 'aggregator', 'cluster', "
             f"got {stop_mode}"
         )
+    if final_agg_mode not in ("prev", "curr"):
+        raise ValueError(f"final_agg_mode must be 'prev' or 'curr', got {final_agg_mode}")
 
     records = {}
     agent_outputs: List[str] = []
@@ -1126,7 +1136,53 @@ def multi_agent_debate(
             agent_confidences = new_confidences
             records[round_key]["confidences"] = new_confidences
 
-        # ----- agents -> aggregator (aggregation of this round) -----
+        # ====== 收敛判断（预聚合阶段，可选） ======
+        converged_pre = False
+        if stop_mode != "aggregator":
+            prev_answers = records[prev_round_key]["answers"]
+            curr_answers = records[round_key]["answers"]
+
+            if stop_mode == "cluster":
+                prev_clusters = _build_answer_clusters(prev_answers)
+                curr_clusters = _build_answer_clusters(curr_answers)
+                converged_pre = _clusters_stable(prev_clusters, curr_clusters, cluster_stable_tol)
+            elif stop_mode == "agent_answers_set":
+                prev_set = {normalize_answer(a) for a in prev_answers if a.strip()}
+                curr_set = {normalize_answer(a) for a in curr_answers if a.strip()}
+                converged_pre = (prev_set == curr_set and len(curr_set) > 0)
+            else:  # stop_mode == "agent_answers"
+                if len(prev_answers) == len(curr_answers) and not dynamic_agents:
+                    # 原始逐 agent 子串匹配逻辑
+                    flag = True
+                    for k in range(len(curr_answers)):
+                        a = normalize_answer(curr_answers[k])
+                        b = normalize_answer(prev_answers[k])
+                        if (a in b) or (b in a):
+                            continue
+                        flag = False
+                        break
+                    converged_pre = flag
+                else:
+                    # agent 数变化 -> 集合稳定性
+                    prev_set = {normalize_answer(a) for a in prev_answers if a.strip()}
+                    curr_set = {normalize_answer(a) for a in curr_answers if a.strip()}
+                    converged_pre = (prev_set == curr_set and len(curr_set) > 0)
+
+        # 若 stop_mode != 'aggregator' 且 final_agg_mode='prev' 且已收敛：
+        # 直接用上一轮 aggregator 的输出作为最终答案，并跳过本轮 aggregation（复刻旧版行为）
+        if stop_mode != "aggregator" and final_agg_mode == "prev" and converged_pre:
+            round_times[round_key] = float(f"{(time.perf_counter() - t_start):.6f}")
+            _log(
+                debug,
+                f"[round={round_key}] converged (pre-aggregation) | "
+                f"time={round_times[round_key]:.2f}s | stop_mode={stop_mode} | final_agg_mode=prev"
+            )
+            records[round_key]["active_indices_after_prune"] = active_indices.copy()
+            # final_aggregation 保持上一轮的 prev_agg
+            final_aggregation = prev_agg
+            break
+
+        # ====== agents -> aggregator (aggregation of this round) ======
         if is_full:
             if projector is None:
                 raise ValueError("projector is required for full-dyprag/full-dyprag-combine")
@@ -1182,55 +1238,36 @@ def multi_agent_debate(
             )
 
         curr_agg = records[round_key]["aggregation"]
+        # 默认情况下，final_aggregation 先指向当前轮聚合结果
         final_aggregation = curr_agg
 
-        # ----- convergence check -----
+        # ====== 收敛判断（聚合后阶段） ======
         converged = False
         if stop_mode == "aggregator":
+            # 必须先聚合再判断收敛（聚合器答案稳定）
             prev_ans = [normalize_answer(a) for a in parse_aggregator_answers(prev_agg or "")]
             curr_ans = [normalize_answer(a) for a in parse_aggregator_answers(curr_agg or "")]
             prev_set = {a for a in prev_ans if a}
             curr_set = {a for a in curr_ans if a}
             converged = (prev_set == curr_set and len(curr_set) > 0)
-
-        elif stop_mode == "cluster":
-            prev_clusters = _build_answer_clusters(records[prev_round_key]["answers"])
-            curr_clusters = _build_answer_clusters(records[round_key]["answers"])
-            converged = _clusters_stable(prev_clusters, curr_clusters, cluster_stable_tol)
-
-        elif stop_mode == "agent_answers_set":
-            # 新收敛判据：始终用答案集合稳定性
-            prev_answers = records[prev_round_key]["answers"]
-            curr_answers = records[round_key]["answers"]
-            prev_set = {normalize_answer(a) for a in prev_answers if a.strip()}
-            curr_set = {normalize_answer(a) for a in curr_answers if a.strip()}
-            converged = (prev_set == curr_set and len(curr_set) > 0)
-
-        else:  # stop_mode == "agent_answers"
-            prev_answers = records[prev_round_key]["answers"]
-            curr_answers = records[round_key]["answers"]
-
-            if len(prev_answers) == len(curr_answers) and not dynamic_agents:
-                # 保持原始实现（逐 agent 子串匹配）以最大限度兼容旧逻辑
-                flag = True
-                for k in range(len(curr_answers)):
-                    a = normalize_answer(curr_answers[k])
-                    b = normalize_answer(prev_answers[k])
-                    if (a in b) or (b in a):
-                        continue
-                    flag = False
-                    break
-                converged = flag
-            else:
-                # 当本轮 agent 数变化（动态裁剪）时，用集合稳定性来判断
-                prev_set = {normalize_answer(a) for a in prev_answers if a.strip()}
-                curr_set = {normalize_answer(a) for a in curr_answers if a.strip()}
-                converged = (prev_set == curr_set and len(curr_set) > 0)
+        else:
+            # 非 aggregator stop_mode，收敛性已在 pre 阶段算好
+            converged = converged_pre
 
         round_times[round_key] = float(f"{(time.perf_counter() - t_start):.6f}")
 
         if converged:
-            _log(debug, f"[round={round_key}] converged | time={round_times[round_key]:.2f}s | stop_mode={stop_mode}")
+            _log(
+                debug,
+                f"[round={round_key}] converged | time={round_times[round_key]:.2f}s "
+                f"| stop_mode={stop_mode} | final_agg_mode={final_agg_mode}"
+            )
+            # 根据 final_agg_mode 选择最终 aggregation
+            if final_agg_mode == "prev":
+                final_aggregation = prev_agg
+            else:
+                final_aggregation = curr_agg
+
             prev_agg = curr_agg
             records[round_key]["active_indices_after_prune"] = active_indices.copy()
             break
@@ -1343,15 +1380,22 @@ def main():
                               "'agent_answers_set' uses answer-set stability; "
                               "'aggregator' uses aggregator answer stability; "
                               "'cluster' uses answer-cluster stability."))
-
     parser.add_argument("--cluster_stable_tol", type=float, default=0.1,
                         help="Tolerance on answer-cluster frequency difference for 'cluster' stop_mode.")
 
-    # >>> 新增：仅高层注入相关 CLI 参数 <<<
+    # 仅高层注入相关 CLI 参数
     parser.add_argument("--high_layer_only", action="store_true",
                         help="If set, only inject LoRA messages into the top-K transformer layers.")
     parser.add_argument("--high_layer_k", type=int, default=4,
                         help="Number of top transformer layers to inject when high_layer_only is enabled.")
+
+    # 控制最终使用哪一轮 aggregator 输出
+    parser.add_argument("--final_agg_mode", type=str, default="curr",
+                        choices=["prev", "curr"],
+                        help=("Which aggregation to use as final answer when convergence is detected. "
+                              "'prev' uses the previous round's aggregation (legacy-style, "
+                              "and for non-aggregator stop_mode may skip current-round aggregation); "
+                              "'curr' uses the current round's aggregation (default)."))
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -1376,9 +1420,10 @@ def main():
         out_tag += f"_STOP-{args.stop_mode}"
         if args.stop_mode == "cluster":
             out_tag += f"_CT{args.cluster_stable_tol:.2f}"
-    # >>> 新增：输出 tag 标注高层注入设置 <<<
     if args.high_layer_only:
         out_tag += f"_HL{args.high_layer_k}"
+    if args.final_agg_mode == "prev":
+        out_tag += "_FAprev"
 
     model_tag = args.model_name.split("/")[-1]
     base_name = os.path.basename(args.data_path)
@@ -1409,7 +1454,7 @@ def main():
 
     # run end-to-end (no resume) and overwrite output
     total_em, counted = 0, 0
-    reached_round3 = 0  # <<< 新增：统计进入 round3 的 case 数量
+    reached_round3 = 0  # 统计进入 round3 的 case 数量
 
     with open(output_path, "w", encoding="utf-8") as out:
         for idx in tqdm(range(len(all_data)), desc="MADAM-RAG (DyPRAG)"):
@@ -1446,9 +1491,9 @@ def main():
                 dynamic_agent_min=args.dynamic_agent_min,
                 stop_mode=args.stop_mode,
                 cluster_stable_tol=args.cluster_stable_tol,
-                # >>> 把高层注入参数传进去 <<<
                 high_layer_only=args.high_layer_only,
                 high_layer_k=args.high_layer_k,
+                final_agg_mode=args.final_agg_mode,
             )
 
             # 统计是否进入 round3：只要记录里存在 round3 key，就认为跑到了第三轮

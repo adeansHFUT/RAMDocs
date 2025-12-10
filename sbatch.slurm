@@ -44,18 +44,18 @@ CMD=(
   --projector_p 32
   --agent_context history
   --debug
-  --first_inject 2
+  --first_inject 0
   #--use_param_agent
 
-  --scale_mode step # step / continuous / no
+  --scale_mode continuous # step / continuous / no
   --low_conf_ratio 0.4
   --low_conf_scale 0.8
   --high_conf_ratio 0
   --high_conf_scale 1
-  --continuous_s_min 0.1
+  --continuous_s_min 0.3
   --continuous_s_max 1.0 
-  --continuous_temperature 1.0 #控制的是“置信度 → 缩放系数”的曲线有多陡、多“硬”。
-  --round_aware_scaling  #后面round缩放得更狠
+  --continuous_temperature 3.0 #控制的是“置信度 → 缩放系数”的曲线有多陡、多“硬”。
+  #--round_aware_scaling  #后面round缩放得更狠
 
   --dynamic_agents  # 是否动态剪枝agent
   --dynamic_agent_frac 0.75 #表示每轮只保留 top n 置信度最高的 agents；
@@ -65,6 +65,9 @@ CMD=(
   --stop_mode agent_answers_set
   #--stop_mode aggregator #看聚合器两轮的 answers set 是否稳定。
   #--stop_mode cluster #看 agent 答案簇结构是否稳定（key 一致且相对频率变化小于 --cluster_stable_tol）
+
+  --high_layer_only
+  --high_layer_k 10  #仅最后k层注入
 )
 
 # --------------------
